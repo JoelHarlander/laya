@@ -2,6 +2,7 @@
 import copy
 import json
 import os
+import platform
 import tempfile
 import threading
 import time
@@ -314,6 +315,84 @@ def _cpu_amp_dtype() -> Optional[torch.dtype]:
         return torch.bfloat16
     return None
 
+
+def _cuda_arch_missing(capability, archs) -> bool:
+    """True when no entry of `archs` (`torch.cuda.get_arch_list()`) runs on `capability`.
+
+    Machine code (`sm_XY`) runs on the same major version at the same or a later minor, so the
+    `sm_60` in PyTorch's CUDA 12.6 wheels runs on a GTX 1080 Ti (6.1); PTX (`compute_XY`) is
+    compiled by the driver for any later GPU. An empty list or a spelling not recognised here
+    counts as covered, so this can only ever explain a failure, never invent one.
+    """
+    major, minor = capability
+    for arch in archs:
+        kind, _, code = arch.partition("_")
+        try:
+            code = int(code.rstrip("af"))
+        except ValueError:
+            return False
+        if kind == "sm" and code // 10 == major and code % 10 <= minor:
+            return False
+        if kind == "compute" and code <= major * 10 + minor:
+            return False
+    return bool(archs)
+
+
+def _cuda_probe(device) -> None:
+    """Run one element-wise kernel on `device` and wait for it."""
+    torch.ones(1, device=device).add_(1)
+    torch.cuda.synchronize(device)
+
+
+def _cuda_unusable(device) -> Optional[str]:
+    """Why this torch build cannot run kernels on the CUDA `device`, or None when it can.
+
+    `torch.cuda.is_available()` only says that a driver and a GPU are present, and placing the
+    model is a copy that launches no kernel. A wheel without kernels for the GPU's architecture --
+    PyPI's CUDA 13.0 wheel on a GTX 1080 Ti -- therefore loaded cleanly and then failed every
+    predict with "no kernel image is available for execution on the device". One kernel finds
+    that out at load time, while the agent can still choose the CPU. Other devices return None.
+    """
+    if device.type != "cuda":
+        return None
+    try:
+        _cuda_probe(device)
+        return None
+    except RuntimeError as e:
+        # The first line names the error; the rest of a CUDA error is CUDA_LAUNCH_BLOCKING advice.
+        reason = (str(e).strip().splitlines() or [type(e).__name__])[0]
+    try:
+        capability = torch.cuda.get_device_capability(device)
+        archs = torch.cuda.get_arch_list()
+        name = torch.cuda.get_device_name(device)
+    except Exception:
+        return reason
+    if not _cuda_arch_missing(capability, archs):
+        return reason
+    hint = ("%s\n  %s is compute capability %d.%d; torch %s has kernels for %s only."
+            % (reason, name, capability[0], capability[1], torch.__version__, " ".join(archs)))
+    if capability < (7, 5) and platform.machine().lower() not in ("aarch64", "arm64"):
+        # Read off the 2.14.0 wheels: cu126 is built for sm_50 through sm_90, every cu13x for sm_75 up.
+        return hint + ("\n  PyTorch's CUDA 12.6 build still has kernels for Maxwell, Pascal and Volta GPUs:\n"
+                       "    pip install torch==%s --index-url https://download.pytorch.org/whl/cu126"
+                       % torch.__version__.split("+")[0])
+    return hint + "\n  See https://pytorch.org/get-started/locally/ for a build that supports it."
+
+
+def _triton_unsupported(device) -> Optional[str]:
+    """Why `torch.compile` cannot generate kernels for `device`, or None when it can.
+
+    Inductor compiles CUDA graphs to Triton, which needs compute capability 7.0 (ROCm aside): on a
+    Pascal GPU (GTX 10-series, P100) a compiled forward raised `GPUTooOldForTriton` on every predict.
+    """
+    if device.type != "cuda" or torch.version.hip is not None:
+        return None
+    major, minor = torch.cuda.get_device_capability(device)
+    if (major, minor) >= (7, 0):
+        return None
+    return "%s is compute capability %d.%d" % (torch.cuda.get_device_name(device), major, minor)
+
+
 def _option_count(qdef: Dict) -> int:
     """How many options a validated question definition renders to.
 
@@ -618,6 +697,11 @@ class Agent(HookRegistry):
                 self.device = torch.device("xpu")
             else:
                 self.device = torch.device("cpu")
+        unusable = _cuda_unusable(self.device)
+        if unusable:
+            warnings.warn("Warning: this PyTorch build cannot run on %s, so the model is running on CPU.\n"
+                          "  Reason: %s" % (self.device, unusable), RuntimeWarning)
+            self.device = torch.device("cpu")
 
         tok_dir = os.path.join(model_dir, "tokenizer")
         self.tok = _load_tokenizer(tok_dir, self.cfg)
@@ -632,6 +716,15 @@ class Agent(HookRegistry):
         _verify_compatibility(self.model, self.cfg, weights, model_id_or_path)
 
         self.model.load_state_dict(weights, strict=True)
+
+        # Keep the eager forward where torch.compile cannot generate kernels, as `fast=True` does
+        # where TileLang cannot run.
+        too_old = _triton_unsupported(self.device) if compile else None
+        if too_old:
+            warnings.warn("Warning: compile=True needs a GPU of compute capability 7.0 or newer for "
+                          "torch.compile's Triton kernels; %s, so the model runs eagerly." % too_old,
+                          RuntimeWarning)
+            compile = False
 
         # ModernBERT's reference_compile defaults to "auto" and will torch.compile the encoder.
         # That is a loss for the batch sizes Laya runs (a handful of questions per call) and can
