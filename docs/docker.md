@@ -35,6 +35,14 @@ layers. VRAM needs depend on the checkpoint, batch size and input length.
 docker compose -f compose.yaml -f compose.cuda.yaml run --build --rm laya
 ```
 
+A GTX 10-series card or another GPU below compute capability 7.5 needs PyTorch's CUDA 12.6
+wheels. That build still has kernels for Maxwell, Pascal and Volta; the CUDA 13 builds start at
+7.5. Direct builds take `--build-arg TORCH_INDEX=cu126`:
+
+```bash
+LAYA_TORCH_INDEX=cu126 docker compose -f compose.yaml -f compose.cuda.yaml run --build --rm laya
+```
+
 The override selects GPU `0` and defaults to `LAYA_DEVICE=cuda`. Set
 `LAYA_GPU_ID` to another host index or UUID. That GPU appears as device `0`
 inside the container. Check access without downloading weights:
