@@ -199,6 +199,20 @@ Install a supported Intel GPU driver first. For an XPU-enabled PyTorch build, in
 
 For a source checkout, replace `pip install laya` with `pip install -e .`. Laya automatically selects an available XPU when no device is specified; you can also request one explicitly with `device="xpu"` in `laya.load()` or `Router(device="xpu")`.
 
+**NVIDIA GTX 10-series and other GPUs below compute capability 7.5**
+
+PyPI's Linux `torch` 2.14 wheel is a CUDA 13.0 build with kernels for compute capability 7.5 (Turing) and newer. A GTX 1080 Ti is 6.1, so on that wheel it has no kernels to run. Install PyTorch's CUDA 12.6 build before Laya. It ships kernels for compute capability 5.0 and newer, which covers Maxwell, Pascal (GTX 10-series, Titan Xp, P100) and Volta:
+
+```bash
+.venv/bin/python -m pip install torch --index-url https://download.pytorch.org/whl/cu126
+.venv/bin/python -m pip install laya
+.venv/bin/python -c "import torch; print(torch.cuda.get_device_name(0), torch.cuda.get_arch_list()); print(torch.ones(1, device='cuda'))"
+```
+
+Windows takes the same index URL. With uv, pass `--torch-backend=cu126` rather than `auto`, which picks the build from the driver version and can choose a CUDA 13 build these GPUs cannot run. The check's last line fails with `no kernel image is available for execution on the device` on a build without kernels for the GPU. Laya runs the same one-kernel check when it loads, so on such a build it falls back to CPU with a warning that names this install command, instead of failing every prediction.
+
+On these GPUs the forward autocasts to fp16, because bf16 needs compute capability 8.0. `compile=True` needs 7.0 for torch's Triton backend, so on a Pascal GPU Laya warns and keeps the eager forward. The TileLang fast path (`fast=True`) has not been run on these GPUs, so leave it off. torch 2.14 also compiles one eager CUDA op the encoder calls, the outer-product `bmm` in its rotary embedding, with Triton on the first prediction. If that prediction fails inside Triton, set `TORCH_DISABLE_NATIVE_JIT=1` to keep the stock kernel. The Docker image already sets it, and [Docker quickstart](https://nandhakishorm.github.io/laya/docker/#nvidia-gpu-cuda) shows the build argument for these GPUs.
+
 **Install from GitHub**
 
 To use the development version instead of the PyPI release, create the virtual environment above and replace its installation command with the appropriate command below. Git must be installed.

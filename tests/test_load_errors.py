@@ -451,6 +451,101 @@ check_true("device fallback/warns instead",
            str([str(w.message) for w in caught]))
 del _fallback
 
+# ------------------------------------------- 9. a GPU the installed torch has no kernels for
+# PyPI's torch 2.14 is a CUDA 13.0 build with kernels for compute capability 7.5 and up. On a GTX
+# 1080 Ti (6.1) `torch.cuda.is_available()` is still True and placing the weights is a plain copy,
+# so the agent loaded on CUDA and then failed every predict with "no kernel image is available for
+# execution on the device". The load now runs one kernel first and lands on CPU with the command
+# that installs a build for that GPU. The arch lists are what the 2.14.0 wheels report.
+from laya import agent as _agent  # noqa: E402
+
+CU126 = ["sm_50", "sm_60", "sm_70", "sm_75", "sm_80", "sm_86", "sm_90"]
+CU130 = ["sm_75", "sm_80", "sm_86", "sm_90", "sm_100", "sm_120"]
+for _name, _cc, _archs, _missing in [
+        ("GTX 1080 Ti on cu130", (6, 1), CU130, True),
+        ("GTX 1080 Ti on cu126", (6, 1), CU126, False),
+        ("Titan V on cu130", (7, 0), CU130, True),
+        ("T4 on cu130", (7, 5), CU130, False),
+        ("RTX 4070 on cu126", (8, 9), CU126, False),
+        ("RTX 5090 on cu126", (12, 0), CU126, True),
+        ("RTX 5090 on sm_90 plus its PTX", (12, 0), ["sm_90", "compute_90"], False),
+        ("an empty arch list", (6, 1), [], False),
+        ("a spelling it does not know", (6, 1), ["gfx90a"], False)]:
+    check("arch/%s" % _name, _agent._cuda_arch_missing(_cc, _archs), _missing)
+
+NO_KERNEL = getattr(torch, "AcceleratorError", RuntimeError)(
+    "CUDA error: no kernel image is available for execution on the device\n"
+    "CUDA kernel errors might be asynchronously reported at some other API call")
+CU126_LINE = ("pip install torch==%s --index-url https://download.pytorch.org/whl/cu126"
+              % torch.__version__.split("+")[0])
+
+
+@contextlib.contextmanager
+def fake_gpu(capability, archs, probe=None, machine="x86_64"):
+    """CUDA reported available, with `probe` as what the agent's one-kernel check raises."""
+    with contextlib.ExitStack() as stack:
+        stack.enter_context(patch("torch.cuda.is_available", return_value=True))
+        stack.enter_context(patch("torch.cuda.get_device_capability", return_value=capability))
+        stack.enter_context(patch("torch.cuda.get_arch_list", return_value=archs))
+        stack.enter_context(patch("torch.cuda.get_device_name", return_value="NVIDIA GeForce GTX 1080 Ti"))
+        stack.enter_context(patch.object(_agent, "_cuda_probe", side_effect=probe))
+        stack.enter_context(patch.object(_agent.platform, "machine", return_value=machine))
+        yield
+
+
+def load_warned(**kw):
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        loaded = load(str(REPO), **kw)
+    return loaded, [str(w.message) for w in caught if issubclass(w.category, RuntimeWarning)]
+
+
+for _device in (None, "cuda"):
+    _label = "1080 Ti on cu130/%s" % (_device or "auto-detected")
+    with fake_gpu((6, 1), CU130, NO_KERNEL):
+        _gpu_agent, _messages = load_warned(device=_device)
+    _msg = next((m for m in _messages if "cannot run on cuda" in m), "")
+    check(_label + " lands on CPU", _gpu_agent.device.type, "cpu")
+    check(_label + " runs in fp32", (_gpu_agent.dtype, _gpu_agent.amp_enabled), (torch.float32, False))
+    check_true(_label + " warns with the CUDA error", "no kernel image is available" in _msg, _messages)
+    check_true(_label + " names the GPU and its capability",
+               "GTX 1080 Ti is compute capability 6.1" in _msg and "sm_75 sm_80" in _msg, _msg)
+    check_true(_label + " gives the cu126 install line", CU126_LINE in _msg, _msg)
+    check_true(_label + " drops the launch-blocking boilerplate", "asynchronously" not in _msg, _msg)
+    del _gpu_agent
+
+# No cu126 wheel carries Pascal kernels on ARM64, so there the advice stays general.
+with fake_gpu((6, 1), CU130, NO_KERNEL, machine="aarch64"):
+    _gpu_agent, _messages = load_warned()
+_msg = next((m for m in _messages if "cannot run on cuda" in m), "")
+check_true("1080 Ti on ARM64/no cu126 line", _msg and "cu126" not in _msg and "get-started" in _msg, _msg)
+del _gpu_agent
+
+# A failure the arch list does not explain still falls back, with the error alone.
+with fake_gpu((6, 1), CU126, RuntimeError("CUDA error: CUDA-capable device(s) is/are busy or unavailable")):
+    _gpu_agent, _messages = load_warned(device="cuda")
+_msg = next((m for m in _messages if "cannot run on cuda" in m), "")
+check("busy GPU/lands on CPU", _gpu_agent.device.type, "cpu")
+check_true("busy GPU/reports the error without an install line",
+           "busy or unavailable" in _msg and "compute capability" not in _msg, _msg)
+del _gpu_agent
+
+# compile=True: inductor targets Triton, which refuses compute capability below 7.0, so a compiled
+# forward raised GPUTooOldForTriton on every predict. Below 7.0 the agent stays eager with a warning.
+# `Module.to` is a no-op here because this torch may have no CUDA; nothing below runs a forward.
+_compiled = []
+for _cc, _want in (((6, 1), False), ((7, 0), True)):
+    with fake_gpu(_cc, CU126), \
+            patch.object(_agent, "compile_model", side_effect=lambda m, **kw: _compiled.append(_cc) or m), \
+            patch.object(torch.nn.Module, "to", lambda self, *a, **kw: self):
+        _gpu_agent, _messages = load_warned(device="cuda", compile=True)
+    _label = "compile on %d.%d" % _cc
+    check(_label + "/stays on the GPU", _gpu_agent.device.type, "cuda")
+    check(_label + "/compiles", (_gpu_agent._compiled, _cc in _compiled), (_want, _want))
+    check(_label + "/ModernBERT reference_compile", _gpu_agent.model.encoder.config.reference_compile, _want)
+    check(_label + "/warns", any("compile=True needs" in m for m in _messages), not _want)
+    del _gpu_agent
+
 
 TMP.cleanup()
 
